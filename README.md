@@ -83,7 +83,7 @@ Everything is orchestrated by a **LangChain Agent** with multiple “Tools,” s
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/your-username/morning-routine-agent.git
+git clone https://github.com/vrajroutu/morning-routine-agent.git
 cd morning-routine-agent
 ```
 
