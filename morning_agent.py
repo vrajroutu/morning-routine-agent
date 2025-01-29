@@ -3,357 +3,255 @@ import time
 import schedule
 import requests
 from datetime import datetime, timedelta
+from typing import List, Dict
 
-# --- Google Calendar imports ---
-import google.auth
-import google.auth.transport.requests
+# Google Calendar imports
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
 # LangChain imports
-from langchain.chat_models import ChatOpenAI
 from langchain.agents import AgentExecutor, initialize_agent, AgentType
-from langchain.schema import HumanMessage
+from langchain.chat_models import ChatOpenAI
+from langchain.schema import SystemMessage, HumanMessage
 from langchain.tools import BaseTool
 
-###############################################################################
-# HELPER FUNCTIONS FOR GOOGLE CALENDAR & TODOIST
-###############################################################################
+# Configuration constants
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+TODOIST_API_URL = "https://api.todoist.com/rest/v2/tasks"
+NEWSAPI_URL = "https://newsapi.org/v2/top-headlines"
+SONOS_BASE_URL = "http://localhost:5005"  # Update with your Sonos server details
 
-def get_today_events_from_google_calendar() -> list:
-    """
-    Fetches today's events from the primary Google Calendar.
-    Returns a list of dicts: [{"title": ..., "time": ...}, ...]
-    """
-    # Assumes you have a 'credentials.json' or 'token.json' in the working directory
-    # from the OAuth flow. Modify as needed.
-    import os.path
-    from google.oauth2.credentials import Credentials
+class CalendarManager:
+    """Handles Google Calendar authentication and event retrieval"""
+    
+    def __init__(self):
+        self.creds = None
+        self.service = None
+        
+    def authenticate(self):
+        """Handle Google OAuth2 authentication flow"""
+        if os.path.exists('token.json'):
+            self.creds = Credentials.from_authorized_user_file('token.json', GOOGLE_SCOPES)
 
-    SCOPES = ["https://www.googleapis.com/auth/calendar.readonly"]
+        if not self.creds or not self.creds.valid:
+            if self.creds and self.creds.expired and self.creds.refresh_token:
+                self.creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', GOOGLE_SCOPES)
+                self.creds = flow.run_local_server(port=0)
+            
+            with open('token.json', 'w') as token:
+                token.write(self.creds.to_json())
 
-    creds = None
-    token_path = "token.json"
-    creds_path = "credentials.json"
+        self.service = build('calendar', 'v3', credentials=self.creds)
+    
+    def get_todays_events(self) -> List[Dict]:
+        """Retrieve today's calendar events"""
+        if not self.service:
+            self.authenticate()
 
-    # Load existing tokens
-    if os.path.exists(token_path):
-        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+        now = datetime.utcnow()
+        start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
+        end_of_day = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + 'Z'
 
-    # If there are no valid creds available, let the user follow the OAuth flow
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(google.auth.transport.requests.Request())
-        else:
-            # Full OAuth flow if needed:
-            from google_auth_oauthlib.flow import InstalledAppFlow
-            flow = InstalledAppFlow.from_client_secrets_file(creds_path, SCOPES)
-            creds = flow.run_local_server(port=0)
-        # Save the creds for the next run
-        with open(token_path, 'w') as token:
-            token.write(creds.to_json())
+        events_result = self.service.events().list(
+            calendarId='primary',
+            timeMin=start_of_day,
+            timeMax=end_of_day,
+            singleEvents=True,
+            orderBy='startTime'
+        ).execute()
 
-    service = build("calendar", "v3", credentials=creds)
+        return [
+            {
+                'title': event.get('summary', 'No Title'),
+                'time': event['start'].get('dateTime', event['start'].get('date')),
+                'description': event.get('description', '')
+            }
+            for event in events_result.get('items', [])
+        ]
 
-    now = datetime.utcnow()
-    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    today_end = today_start + timedelta(days=1)
+class TodoistManager:
+    """Handles Todoist task management"""
+    
+    def __init__(self):
+        self.api_token = os.getenv('TODOIST_API_TOKEN')
+        if not self.api_token:
+            raise ValueError("TODOIST_API_TOKEN environment variable not set")
 
-    time_min = today_start.isoformat() + "Z"  # 'Z' indicates UTC time
-    time_max = today_end.isoformat() + "Z"
+    def get_todays_tasks(self) -> List[Dict]:
+        """Retrieve tasks due today"""
+        headers = {'Authorization': f'Bearer {self.api_token}'}
+        params = {'filter': 'today'}
+        
+        try:
+            response = requests.get(TODOIST_API_URL, headers=headers, params=params)
+            response.raise_for_status()
+            return [
+                {
+                    'task': item.get('content'),
+                    'due': item.get('due', {}).get('date'),
+                    'priority': item.get('priority')
+                }
+                for item in response.json()
+            ]
+        except requests.exceptions.RequestException as e:
+            print(f"Todoist API error: {str(e)}")
+            return []
 
-    events_result = service.events().list(
-        calendarId="primary",
-        timeMin=time_min,
-        timeMax=time_max,
-        singleEvents=True,
-        orderBy="startTime"
-    ).execute()
+class NewsManager:
+    """Handles news retrieval from NewsAPI"""
+    
+    def __init__(self):
+        self.api_key = os.getenv('NEWSAPI_API_KEY')
+        if not self.api_key:
+            raise ValueError("NEWSAPI_API_KEY environment variable not set")
 
-    events = events_result.get("items", [])
-    results = []
-    for event in events:
-        start = event.get("start", {})
-        summary = event.get("summary", "No Title")
-        # Attempt to parse a time
-        start_time = start.get("dateTime", start.get("date", None))
-        results.append({"title": summary, "time": start_time})
-    return results
-
-
-def get_todays_todoist_tasks() -> list:
-    """
-    Fetches tasks due today from Todoist.
-    Returns a list of dicts: [{"task": ..., "due": ...}, ...]
-    """
-    token = os.environ.get("TODOIST_API_TOKEN")
-    if not token:
-        return [{"error": "Missing TODOIST_API_TOKEN"}]
-
-    # We'll call the 'tasks' endpoint with a filter for 'today'
-    # https://developer.todoist.com/rest/v2/#get-active-tasks
-    url = "https://api.todoist.com/rest/v2/tasks"
-    headers = {"Authorization": f"Bearer {token}"}
-    params = {"filter": "today"}  # tasks due 'today'
-    resp = requests.get(url, headers=headers, params=params)
-    if resp.status_code != 200:
-        return [{"error": f"Todoist API error: {resp.text}"}]
-
-    data = resp.json()  # list of tasks
-    results = []
-    for item in data:
-        content = item.get("content")
-        due_date = item.get("due", {}).get("date")
-        results.append({"task": content, "due": due_date})
-    return results
-
-
-###############################################################################
-# TOOLS
-###############################################################################
-
-class AlarmTool(BaseTool):
-    """
-    Triggers an alarm or Alexa routine. Placeholder uses simple print statements,
-    but you can adapt to your real system.
-    """
-    name = "alarm_tool"
-    description = (
-        "Use this to ring the alarm. Input should be a short string describing the event "
-        "like 'morning alarm'. The output will confirm if the alarm triggered."
-    )
-
-    def _run(self, query: str) -> str:
-        print("[AlarmTool] Triggered the alarm (placeholder).")
-        # Example or placeholder call:
-        # requests.post("https://my-alarm-device.com/trigger", json={"reason": query})
-        return "Alarm sounded successfully."
-
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("AlarmTool does not support async")
-
-
-class FetchNewsTool(BaseTool):
-    """
-    A tool to fetch news headlines from NewsAPI.org for a given topic.
-    Returns up to 5 articles in JSON-ish format.
-    """
-    name = "fetch_news"
-    description = (
-        "Use this to fetch the latest news headlines about a given topic. "
-        "Input should be a string specifying topics or keywords, e.g., 'stock market', 'politics'. "
-        "Output is JSON-like text with article info."
-    )
-
-    def _run(self, query: str) -> str:
-        api_key = os.environ.get("NEWSAPI_API_KEY")
-        if not api_key:
-            return "Error: Missing NEWSAPI_API_KEY environment variable."
-
-        url = "https://newsapi.org/v2/top-headlines"
+    def get_news(self, topic: str) -> List[Dict]:
+        """Retrieve news articles for a specific topic"""
         params = {
-            "apiKey": api_key,
-            "q": query,
-            "language": "en",
-            "pageSize": 5
+            'apiKey': self.api_key,
+            'q': topic,
+            'pageSize': 5,
+            'language': 'en'
         }
-        resp = requests.get(url, params=params)
-        if resp.status_code != 200:
-            return f"Error from NewsAPI: {resp.text}"
+        
+        try:
+            response = requests.get(NEWSAPI_URL, params=params)
+            response.raise_for_status()
+            return [
+                {
+                    'title': article.get('title'),
+                    'source': article.get('source', {}).get('name'),
+                    'description': article.get('description'),
+                    'url': article.get('url')
+                }
+                for article in response.json().get('articles', [])
+            ]
+        except requests.exceptions.RequestException as e:
+            print(f"NewsAPI error: {str(e)}")
+            return []
 
-        data = resp.json()
-        articles = data.get("articles", [])
-        return str(articles)
+class SmartHomeTools:
+    """Collection of smart home control tools"""
+    
+    @staticmethod
+    def trigger_alarm(message: str) -> str:
+        """Trigger alarm system (mock implementation)"""
+        print(f"[ALARM] Triggered: {message}")
+        return f"Alarm activated: {message}"
 
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("FetchNewsTool does not support async")
+    @staticmethod
+    def play_music(query: str) -> str:
+        """Control Sonos music (mock implementation)"""
+        print(f"[MUSIC] Playing: {query}")
+        return f"Now playing: {query}"
 
+class MorningRoutineAgent:
+    """Main agent class handling the morning routine workflow"""
+    
+    def __init__(self):
+        self.calendar = CalendarManager()
+        self.todoist = TodoistManager()
+        self.news = NewsManager()
+        self.agent = self._initialize_agent()
 
-class SummarizeTextTool(BaseTool):
-    """
-    Summarizes text using the LLM.
-    """
-    name = "summarize_text"
-    description = (
-        "Use this to summarize any text input. "
-        "Input should be a long string. Output will be a short summary."
-    )
+    def _initialize_agent(self) -> AgentExecutor:
+        """Initialize LangChain agent with tools"""
+        tools = [
+            BaseTool(
+                name="get_calendar_events",
+                func=lambda _: str(self.calendar.get_todays_events()),
+                description="Get today's calendar events"
+            ),
+            BaseTool(
+                name="get_todoist_tasks",
+                func=lambda _: str(self.todoist.get_todays_tasks()),
+                description="Get today's Todoist tasks"
+            ),
+            BaseTool(
+                name="get_news_summary",
+                func=lambda topic: str(self.news.get_news(topic)),
+                description="Get news summary for a specific topic"
+            ),
+            BaseTool(
+                name="trigger_alarm",
+                func=SmartHomeTools.trigger_alarm,
+                description="Trigger alarm system"
+            ),
+            BaseTool(
+                name="play_music",
+                func=SmartHomeTools.play_music,
+                description="Play music on Sonos system"
+            )
+        ]
 
-    def _run(self, text: str) -> str:
         llm = ChatOpenAI(
             temperature=0.3,
             model_name="gpt-3.5-turbo",
-            openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
+            openai_api_key=os.getenv('OPENAI_API_KEY')
         )
-        messages = [
-            HumanMessage(
-                content=(
-                    "Please summarize the following text in a concise, conversational style:\n\n"
-                    f"{text}\n\nSummary:"
-                )
-            )
-        ]
-        response = llm(messages)
-        return response.content.strip()
 
-    async def _arun(self, text: str) -> str:
-        raise NotImplementedError("SummarizeTextTool does not support async")
+        system_message = SystemMessage(content=(
+            "You are an advanced home assistant AI. Your morning routine includes:\n"
+            "1. Triggering the wake-up alarm\n"
+            "2. Providing news summary (technology and business)\n"
+            "3. Reporting today's calendar events\n"
+            "4. Listing Todoist tasks\n"
+            "5. Starting morning music\n"
+            "Respond in concise, natural language with emojis."
+        ))
 
+        return initialize_agent(
+            tools=tools,
+            llm=llm,
+            agent=AgentType.OPENAI_FUNCTIONS,
+            agent_kwargs={"system_message": system_message},
+            verbose=True
+        )
 
-class StartMusicTool(BaseTool):
-    """
-    Turns on music in the hallway via Sonos HTTP API (placeholder).
-    Node-Sonos-HTTP-API is typical at: http://<sonos-server>:5005/<ROOM>/play/<URI or search>
-    """
-    name = "start_music"
-    description = (
-        "Use this to start music in the hallway. Input can be a short string like 'play jazz' or 'play morning playlist'."
-    )
-
-    def _run(self, query: str) -> str:
-        # Example usage for node-sonos-http-api:
-        # SONOS_SERVER = "http://localhost:5005"
-        # HALLWAY_ROOM = "Hallway"
-        # search_term = query.replace(" ", "%20")
-        # url = f"{SONOS_SERVER}/{HALLWAY_ROOM}/say/{search_term}"
-        # Or play from a favorite or station:
-        # url = f"{SONOS_SERVER}/{HALLWAY_ROOM}/musicsearch/spotify/album:{search_term}"
-        #
-        # We'll just print for example:
-        print("[StartMusicTool] Attempting to start Sonos hallway music:", query)
-        return f"Sonos hallway music started with: {query}"
-
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("StartMusicTool does not support async")
-
-
-class CalendarTool(BaseTool):
-    """
-    Fetches today's Google Calendar events.
-    """
-    name = "calendar_tool"
-    description = (
-        "Use this to retrieve a list of today's calendar events. "
-        "Input should be 'get my meetings today'. Output: JSON or text about events."
-    )
-
-    def _run(self, query: str) -> str:
-        events = get_today_events_from_google_calendar()
-        return str(events)
-
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("CalendarTool does not support async")
-
-
-class TasksTool(BaseTool):
-    """
-    Fetches today's tasks from Todoist.
-    """
-    name = "tasks_tool"
-    description = (
-        "Use this to retrieve a list of tasks due today from Todoist. "
-        "Input should be 'get my tasks'. Output: JSON or text about tasks."
-    )
-
-    def _run(self, query: str) -> str:
-        tasks = get_todays_todoist_tasks()
-        return str(tasks)
-
-    async def _arun(self, query: str) -> str:
-        raise NotImplementedError("TasksTool does not support async")
-
-###############################################################################
-# BUILD AGENT
-###############################################################################
-
-def build_agent() -> AgentExecutor:
-    """
-    Create an agent that:
-      1) Triggers an alarm
-      2) Fetches & summarizes Stock Market + Politics news
-      3) Retrieves today's Google Calendar events
-      4) Retrieves today's Todoist tasks
-      5) Starts Sonos music in the hallway
-    Then returns a final summary to the user.
-    """
-
-    # Tools
-    alarm_tool = AlarmTool()
-    fetch_tool = FetchNewsTool()
-    summarize_tool = SummarizeTextTool()
-    music_tool = StartMusicTool()
-    calendar_tool = CalendarTool()
-    tasks_tool = TasksTool()
-
-    tools = [
-        alarm_tool, fetch_tool, summarize_tool,
-        music_tool, calendar_tool, tasks_tool
-    ]
-
-    # LLM
-    llm = ChatOpenAI(
-        temperature=0.0,
-        model_name="gpt-3.5-turbo",  # or "gpt-4"
-        openai_api_key=os.environ.get("OPENAI_API_KEY", "")
-    )
-
-    system_message = (
-        "You are a helpful home-assistant agent. You have the following tools:\n"
-        " - alarm_tool: ring the alarm\n"
-        " - fetch_news: get news headlines\n"
-        " - summarize_text: summarize text\n"
-        " - start_music: start music in the hallway (Sonos)\n"
-        " - calendar_tool: get today's Google Calendar events\n"
-        " - tasks_tool: get today's Todoist tasks\n\n"
-        "When asked to run the 'morning routine' you should:\n"
-        " 1) Trigger the alarm.\n"
-        " 2) Fetch news about 'stock market' and 'politics' (fetch_news).\n"
-        " 3) Summarize that news (summarize_text).\n"
-        " 4) Retrieve today's Google Calendar events (calendar_tool).\n"
-        " 5) Retrieve today's Todoist tasks (tasks_tool).\n"
-        " 6) Start Sonos music in the hallway (start_music), e.g. 'play morning playlist'.\n"
-        "Then provide a final summary of what you did, including any relevant details (events, tasks, news highlights)."
-        "Stop after completing these steps.\n"
-    )
-
-    # Build the agent
-    agent = initialize_agent(
-        tools=tools,
-        llm=llm,
-        agent=AgentType.OPENAI_FUNCTIONS,  # or ZERO_SHOT_REACT_DESCRIPTION
-        verbose=True,
-        system_message=system_message,
-    )
-    return agent
-
-
-###############################################################################
-# SCHEDULING
-###############################################################################
-
-def run_morning_routine(agent: AgentExecutor):
-    """
-    The function the schedule calls at 07:00 daily.
-    We simply pass 'Please run morning routine.' to the agent,
-    which orchestrates the steps via Tools.
-    """
-    user_message = "Please run morning routine."
-    response = agent.run(user_message)
-    print("\n=== Final Agent Response ===")
-    print(response)
+    def run_routine(self):
+        """Execute the morning routine"""
+        prompt = """Execute the full morning routine:
+        1. Trigger the wake-up alarm
+        2. Get technology and business news summaries
+        3. Retrieve today's calendar events
+        4. List today's Todoist tasks
+        5. Start morning playlist
+        Provide final summary in friendly tone."""
+        
+        try:
+            response = self.agent.run(prompt)
+            print("\n=== Morning Routine Complete ===")
+            print(response)
+        except Exception as e:
+            print(f"Error running routine: {str(e)}")
 
 def main():
-    agent = build_agent()
+    """Main execution and scheduling"""
+    agent = MorningRoutineAgent()
+    
+    # Schedule daily at 7 AM
+    schedule.every().day.at("07:00").do(agent.run_routine)
+    print("Morning routine scheduler started. Waiting for 7 AM trigger...")
 
-    # Schedule daily at 07:00
-    schedule.every().day.at("07:00").do(run_morning_routine, agent=agent)
-
-    print("Scheduled the agent to run every day at 07:00.")
-
+    # Keep the script running
     while True:
         schedule.run_pending()
-        time.sleep(30)
-
+        time.sleep(60)
 
 if __name__ == "__main__":
-    main()
+    # Load environment variables
+    from dotenv import load_dotenv
+    load_dotenv()
     
+    # Validate required environment variables
+    required_vars = ['OPENAI_API_KEY', 'TODOIST_API_TOKEN', 'NEWSAPI_API_KEY']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+    
+    main()
